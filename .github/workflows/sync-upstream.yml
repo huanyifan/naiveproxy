@@ -1,0 +1,154 @@
+name: Sync NaiveProxy and build
+
+on:
+  schedule:
+    - cron: '23 19 * * *' # 03:23 in Singapore
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-naiveproxy-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      build: ${{ steps.sync.outputs.build }}
+      chromium: ${{ steps.sync.outputs.chromium }}
+      release: ${{ steps.sync.outputs.release }}
+      snapshot: ${{ steps.sync.outputs.snapshot }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Mirror the latest official release source
+        id: sync
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM: klzgrad/naiveproxy
+        run: |
+          set -euo pipefail
+
+          release=$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)
+          [[ "$release" =~ ^v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$ ]]
+          git fetch --no-tags --depth=1 "https://github.com/$UPSTREAM.git" "refs/tags/$release"
+          upstream_commit=$(git rev-parse 'FETCH_HEAD^{commit}')
+          chromium=$(git show "$upstream_commit:CHROMIUM_VERSION")
+          [[ "$chromium" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$release" == "v$chromium-"* ]]
+
+          mirror_ref=refs/heads/upstream-source
+          previous=$(git ls-remote --heads origin "$mirror_ref" | cut -f1)
+          if [[ -n "$previous" ]]; then
+            git fetch --no-tags --depth=1 origin "$mirror_ref"
+            previous=$(git rev-parse FETCH_HEAD)
+          fi
+
+          # Keep this fork's automation on its default branch. Omit the
+          # upstream workflow definitions from the source-only mirror.
+          temp=$(mktemp -d)
+          trap 'rm -rf "$temp"' EXIT
+          tree=$(
+            export GIT_INDEX_FILE="$temp/index"
+            git read-tree "$upstream_commit"
+            git rm -rfq --cached --ignore-unmatch .github/workflows
+            git write-tree
+          )
+
+          message=$(printf 'Sync NaiveProxy %s\n\nUpstream-Commit: %s\n' "$release" "$upstream_commit")
+          snapshot=$previous
+          if [[ -z "$previous" ]] ||
+             [[ "$(git rev-parse "$previous^{tree}")" != "$tree" ]] ||
+             [[ "$(git show -s --format=%B "$previous")" != "$message" ]]; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            options=(-m "$message")
+            if [[ -n "$previous" ]]; then
+              options+=(-p "$previous")
+            fi
+            snapshot=$(git commit-tree "$tree" "${options[@]}")
+            git push origin "$snapshot:$mirror_ref"
+          fi
+
+          # Only a successful build writes this tag. If a build fails,
+          # the next run can retry even if the source is already synced.
+          marker="refs/tags/built-chromium/$chromium"
+          existing=$(git ls-remote --refs origin "$marker")
+          build=true
+          if [[ -n "$existing" ]]; then
+            build=false
+          fi
+
+          {
+            echo "build=$build"
+            echo "chromium=$chromium"
+            echo "release=$release"
+            echo "snapshot=$snapshot"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "Upstream: $release ($upstream_commit)"
+            echo "Source snapshot: $snapshot"
+            echo "Build needed: $build"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      EXTRA_FLAGS: 'target_cpu="x64"'
+      CHROMIUM: ${{ needs.sync.outputs.chromium }}
+      UPSTREAM_RELEASE: ${{ needs.sync.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.snapshot }}
+          persist-credentials: false
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config ccache bubblewrap
+      - name: Prepare the official toolchain and sysroot
+        working-directory: src
+        run: |
+          rm -f build/linux/sysroot_scripts/keyring.gpg
+          GPG_TTY=/dev/null ./build/linux/sysroot_scripts/generate_keyring.sh
+          ./get-clang.sh
+      - name: Compile and test Linux x64
+        working-directory: src
+        run: |
+          ./build.sh
+          test "$(out/Release/naive --version)" = "naive $CHROMIUM"
+          ../tests/basic.sh out/Release/naive
+      - name: Package Linux x64 binary
+        run: |
+          bundle="naiveproxy-${UPSTREAM_RELEASE}-linux-x64"
+          mkdir -p "dist/$bundle"
+          cp src/out/Release/naive src/config.json LICENSE USAGE.txt "dist/$bundle/"
+          tar -C dist -cJf "dist/$bundle.tar.xz" "$bundle"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: naiveproxy-${{ needs.sync.outputs.release }}-linux-x64
+          path: dist/*.tar.xz
+          if-no-files-found: error
+
+  record:
+    needs: [sync, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Record the successfully built Chromium version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHROMIUM: ${{ needs.sync.outputs.chromium }}
+          SNAPSHOT: ${{ needs.sync.outputs.snapshot }}
+        run: |
+          gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f ref="refs/tags/built-chromium/$CHROMIUM" \
+            -f sha="$SNAPSHOT"
